@@ -1,0 +1,614 @@
+#include<iostream>
+#include<fstream>
+#include<string>
+using namespace std;
+
+struct Entry{
+	int key;
+	int value;
+	};
+
+
+// Prefix Scan using serial Algorithm
+void serialScan(unsigned *start,unsigned *count,int n){
+	start[0] = 0;
+	for (int i = 1;i<n;i++)
+			start[i] = start[i-1] + count[i-1];	
+	}
+		
+void giveout(string str,unsigned *var,int size){
+ofstream fo;
+fo.open(str.c_str());
+for (int i = 0;i<size;i++)
+		fo<<var[i]<<endl;
+fo.close();
+}
+void giveout(string str,int *var,int size){
+ofstream fo;
+fo.open(str.c_str());
+for (int i = 0;i<size;i++)
+		fo<<var[i]<<endl;
+fo.close();
+}
+
+void giveout(string str,Entry *var,int size){
+ofstream fo;
+fo.open(str.c_str());
+for (int i = 0;i<size;i++)
+		fo<<var[i].key<<"\t"<<var[i].value<<endl;
+fo.close();
+}
+// Funtion that hashes key-value pairs in the bucket
+__global__ void
+phase1(unsigned* count, Entry* entry,unsigned *offset, int n,int N,int a, int b, int* global_flag,int max_per_bucket ){
+// for all k belong to  keys, in parallel do 
+	int i = blockDim.x * blockIdx.x +threadIdx.x;
+	if (i < N){
+		unsigned kPrime = 1900813;
+// 	 compute g(k) to determine bucket b_k containing k
+		int indexd = ((a * entry[i].key + b) % kPrime) % n;
+
+//	 atomically increment count[b_k], learning internal offset[k]
+
+		offset[i] = atomicAdd(&count[indexd],1);
+		
+		__syncthreads();
+	global_flag[i] = 0;		
+	if(count[indexd]>max_per_bucket)
+			global_flag[i] = -1;
+// end for
+	}
+}
+
+// Funtion used to store in phase1
+__global__ void
+store(Entry* shuffled, Entry* entry, unsigned* start, unsigned* offset, int a, int b, int n,int N){
+// for all key value pairs, do in parallel
+// store (k,v) in shuffled[] at index start[b_k]+offset[k]
+	int i = blockDim.x * blockIdx.x + threadIdx.x;
+	unsigned kPrime = 1900813;
+	if(i<N){
+		int index = ((a * entry[i].key + b) % kPrime) % n;
+		shuffled[offset[i] + start[index]] = entry[i];
+	}
+}
+		
+__global__
+void phase2(unsigned *random_numbers,Entry *shuffled, Entry *cuckoo, unsigned *start,unsigned *seed, int subtable_size, int N){
+	int i = blockDim.x * blockIdx.x + threadIdx.x;			// Thread
+	if(i<N){
+	// Define constants for 3 subtables
+		__shared__ int j;
+		__shared__ unsigned max_seeds;
+		__shared__ unsigned *sh_subtable_1, *sh_subtable_2, *sh_subtable_3;	
+		__shared__ unsigned *sh_hash_built;
+	
+		if(threadIdx.x == 0){
+			sh_subtable_1 = new unsigned[subtable_size];
+			sh_subtable_2 = new unsigned[subtable_size];
+			sh_subtable_3 = new unsigned[subtable_size];
+			sh_hash_built = new unsigned;
+			max_seeds = 20;
+			j = blockIdx.x;
+			}
+		
+		__syncthreads();
+	
+		int has_pair;
+		unsigned seed_index = 0;
+		
+		if(shuffled[i].key != 0xffff)
+				has_pair = 1;
+		else
+				has_pair = 0;
+
+		int in_subtable = -1;
+		unsigned index_x, index_y, index_z;
+		do{
+// 		generate the h_i(k) using one seed
+			short random_number_seed = random_numbers[seed_index++];
+	
+			unsigned constants_0 = random_number_seed ^ 0xffff;
+			unsigned constants_1 = random_number_seed ^ 0xcba9;
+			unsigned constants_2 = random_number_seed ^ 0x7531;
+			unsigned constants_3 = random_number_seed ^ 0xbeef;
+			unsigned constants_4 = random_number_seed ^ 0xd9f1;
+			unsigned constants_5 = random_number_seed ^ 0x337a;
+		
+			unsigned kPrime = 1900813;
+
+			unsigned key = shuffled[i].key;
+//		pre-compute h_i(k) for all keys k	
+			index_x = ((constants_0 * key + constants_1)%kPrime) % subtable_size;
+			index_y = ((constants_2 * key + constants_3)%kPrime) % subtable_size;
+			index_z = ((constants_4 * key + constants_5)%kPrime) % subtable_size;
+	
+			int max_iterations = 100;	
+			for(int iteration = 1; iteration <= max_iterations; ++iteration){
+				if (threadIdx.x == 0)
+					*sh_hash_built = 0;
+//		while any k is uninserted and failure is unlikely do 	
+//			write all uninserted k into slot g_1(k)
+				if (has_pair && in_subtable == -1){
+					sh_subtable_1[index_x] = key;
+					in_subtable = 1;
+					}
+//			synchronize threads
+				__syncthreads();
+	
+//			check subtable T_1  and write all uninserted key into slot g_2(k)
+				if (has_pair && in_subtable == 1 && sh_subtable_1[index_x] != key) {
+					sh_subtable_2[index_y] = key;
+					in_subtable = 2;
+					}
+//			synchronize threads			
+				__syncthreads();
+
+//			check subtable T_2  and write all uninserted key into slot g_3(k)
+				if ( has_pair && in_subtable == 2 && sh_subtable_2[index_y] != key) {
+					sh_subtable_3[index_z] = key;
+					in_subtable = 3;
+					}
+//			synchronize threads			
+				__syncthreads();	
+
+//			check subtable T_3
+				if ( has_pair && in_subtable == 3 && sh_subtable_3[index_z] != key) {
+					*sh_hash_built = 1;
+					in_subtable = -1;
+					}
+			
+//			synchronize threads
+				__syncthreads();
+			
+//			evaluate if hash_built
+				if (*sh_hash_built == 0) 
+						break;
+				__syncthreads();
+			}
+		}while(*sh_hash_built && seed_index < max_seeds);
+
+//	write subtables T_1, T_2 and T_3 into cuckoo[] and 
+		if (in_subtable == 1 && has_pair){
+				int position = 3 * j  * subtable_size + index_x;
+				cuckoo[position].key 	= shuffled[i].key;
+				cuckoo[position].value	= shuffled[i].value;
+				}
+		else if (in_subtable == 2 && has_pair){
+				int position = (3 * j +1) * subtable_size + index_y;
+				cuckoo[position].key 	= shuffled[i].key;
+				cuckoo[position].value	= shuffled[i].value;
+				}
+		else if (in_subtable == 3 && has_pair){
+				int position = (3 * j  +2) * subtable_size + index_z;
+				cuckoo[position].key 	= shuffled[i].key;
+				cuckoo[position].value	= shuffled[i].value;
+				}
+//  Write the final seed used into seed[b]: only one thread from each block
+		if (threadIdx.x == blockDim.x * blockIdx.x + 0)
+				seed[j] = random_numbers[seed_index-1];
+	}
+	__syncthreads();
+}
+
+int ceiling(float a){
+	int b = (int)a + 1 ;
+	return b;
+	}
+	
+/**********************MAIN STARTS HERE******************************************************************/
+int main(int argc, char *argv[]){
+
+cudaError_t err = cudaSuccess;
+string s;
+// Generate key value pairs
+
+int N = 10000;
+const char* Nc = argv[1];
+if (Nc){
+		cout<<"No arguements for number of key-value pairs provided..\n";
+		cout<<"Using default value of 10000 key-value pairs\n";
+		N = atoi(Nc);
+	}
+	
+Entry *entry;
+entry = new Entry[N];
+cout<<"\nGenerating "<<N<<" key-value pairs\n";
+for (int i = 0;i < N; i++){
+		entry[i].key = i+1;
+		entry[i].value = rand()%100;
+		}
+cout<<"Bulding Hash Table using 2 phase Cuckoo Algorithm for "<<N<<" entries"<<endl;
+cout<<"Initializing Phase I of hashing...\n";
+/********************** Phase I *******************************/
+// INPUT: key value pairs and size of the array
+// OUTPUT: shuffled[] and start[]
+
+// Estimate the number of buckets
+float occupancy =		0.8;
+int size_table =		N;
+int max_per_bucket =	512;
+int number_of_buckets = (int)size_table /(occupancy*max_per_bucket)+1;
+bool bucket_overflow = 0;
+
+// Timer specific variables
+cudaEvent_t begin,stop;
+float time;
+cudaEventCreate(&begin);
+cudaEventCreate(&stop);
+ofstream timer;
+timer.open("countTime.txt");
+
+// Allocate output arrays and scratch space
+Entry *shuffled;
+shuffled = new Entry[size_table];
+
+unsigned *start;
+start = new unsigned[number_of_buckets];
+unsigned *count;
+count = new unsigned[number_of_buckets];
+unsigned *offset;
+offset = new unsigned[N];
+int *global_flag = new int[N];
+
+for(int i = 0; i<number_of_buckets;i++)
+	global_flag[i] = 100;
+	
+int threadsPerBlock = 512;
+int num_blocks = number_of_buckets;
+int a,b;
+int ctr = 0;
+
+// Allocating scratch space on device
+cout<<"Allocating scratch space on device\n";
+cout<<"Allocating memory for count[], entry[] and offset[]\n";
+
+unsigned *d_count = NULL;
+size_t size_count = number_of_buckets*sizeof(unsigned);
+
+Entry *d_entry = NULL;
+size_t size_entry = N*sizeof(Entry);	
+
+unsigned *d_offset = NULL;
+
+int *d_global_flag;
+
+err = cudaMalloc((void**)&d_count,size_count);
+if (err != cudaSuccess){
+	cout<<"Could not allocate memory to d_count[]\n";
+	exit(0);
+	}
+	
+err = cudaMalloc((void**)&d_entry,size_entry);
+if (err != cudaSuccess){
+	cout<<"Could not allocate memory to d_entry[]\n";
+	exit(0);
+	}
+		
+err = cudaMalloc((void**)&d_offset,N*sizeof(unsigned));	
+if (err != cudaSuccess){
+	cout<<"Could not allocate memory to d_offset[]\n";
+	exit(0);
+	}
+
+err = cudaMalloc((void**)&d_global_flag,N*sizeof(int));
+if (err != cudaSuccess){
+	cout<<"Could not allocate memory for global_flag\n";
+	exit(0);
+	}
+
+// Copy variables to device
+
+cout<<"Copy global_flag to cuda device\n";
+err = cudaMemcpy(d_global_flag,global_flag,N*sizeof(int),cudaMemcpyHostToDevice);
+if (err!= cudaSuccess){
+	cout<<"Could not copy global_flag to CUDA device\n";
+	exit(0);
+	}
+
+cout<<"\nCopying entry[] for sorting into buckets, from host to CUDA device...\n";
+err = cudaMemcpy(d_entry,entry,size_entry,cudaMemcpyHostToDevice);
+if(err!= cudaSuccess){
+	cout<<"Could not copy entry[] to device!!!\n";
+	exit(0);
+	}
+
+cout<<"Hashing on "<<num_blocks<<" blocks with "<<threadsPerBlock<<" threads per block...\n";
+
+// Repeat
+do{
+// Set all bucket size counters count[i] = 0;
+	cout<<"Setting bucket size counters to zero\n";
+	for (int i = 0;i < number_of_buckets;i++)
+			count[i] = 0;	
+
+// Constants defining hash functions
+	cout<<"Defining constants for bucket hash function\n";
+	a = rand();
+	b = rand();
+	cout<<"a,b = "<<a<<"\t"<<b<<endl;
+	
+	cout<<"Copying initialized count[]\n";
+	err = cudaMemcpy(d_count,count,size_count,cudaMemcpyHostToDevice);
+	if(err!= cudaSuccess){
+		cout<<"Could not copy count[] to device!!!\n";
+		exit(0);
+		}
+			
+	cout<<"Calling phase1()\n";
+	
+	cudaEventRecord(begin);	
+		
+// Calling phase1() 
+	phase1<<<num_blocks,threadsPerBlock>>>(d_count,d_entry,d_offset,number_of_buckets,N,a,b,d_global_flag,max_per_bucket);
+
+	cudaEventRecord(stop);
+
+
+// Copy back from device
+	cout<<"Copying back global_flag[] from device\n";
+	err = cudaMemcpy(global_flag,d_global_flag,N*sizeof(int),cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess){
+		cout<<"Could not copy global_flag back to host\n";cout<<cudaGetErrorString(err)<<endl;
+		exit(0);
+		}
+
+// Checking if the bucket has overflown
+	cout<<"Checking for overflow of bucket\n";
+	bucket_overflow = 0;
+	for (int i = 0;i < N; i++){
+			if (global_flag[i] == -1){
+				cout<<"Bucket overfill... Rehashing using new hash function\n";
+				bucket_overflow = 1;
+				ctr++;
+				break;
+				}
+			}
+
+ }while(bucket_overflow == 1 && ctr<10);	
+
+	cout<<"Copying back count[] and offset[] from device\n";
+	err = cudaMemcpy(count,d_count,size_count,cudaMemcpyDeviceToHost);
+	if (err !=  cudaSuccess){
+		cout<<"Could not copy count[] back to host!!!\n";
+		exit(0);
+		}
+	
+	err = cudaMemcpy(offset,d_offset,N*sizeof(unsigned),cudaMemcpyDeviceToHost);
+	if (err !=  cudaSuccess){
+		cout<<"Could not copy offset[] back to host!!!\n";
+		exit(0);
+		}
+
+ if (ctr >=10) {
+ 		cout<<"Phase I hashing failed. Exiting...\n";
+ 		exit(0);
+ 		}
+ 		
+ 	cudaEventSynchronize(stop);
+ 	cudaEventElapsedTime(&time, begin, stop);
+ 	timer<<"Phase 1: "<<time<<endl;	
+
+// Perform prefix sum on count[] to determine start[] in SERIAL 
+cout<<"Calling serialScan()\n";
+	
+	cudaEventRecord(begin);
+	serialScan(start,count,number_of_buckets);
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&time, begin, stop);
+	
+	timer<<"Serial Scan: "<<time<<endl;
+
+	Entry* d_shuffled;
+	unsigned *d_start = NULL;
+	
+	cout<<"Allocating memory for start[] and shuffled[]\n";
+	
+	err = cudaMalloc((void**)&d_shuffled,N*sizeof(Entry));
+	if (err!= cudaSuccess){
+		cout<<"Could not allocate memory to shuffled[] on CUDA device\n";
+		exit(0);
+		}
+
+	err = cudaMalloc((void**)&d_start,size_count);
+	if (err!=cudaSuccess){
+		cout<<"\nCould not allocate memory to d_start[] on CUDA device\n";
+		exit(0);
+		}
+	
+	cout<<"Copying offset[] and start[] to cuda device\n";	
+
+	err = cudaMemcpy(d_offset,offset,N*sizeof(unsigned),cudaMemcpyHostToDevice);
+	if (err != cudaSuccess){
+		cout<<"Could not copy offset to cuda device\n";
+		exit(0);
+		}
+	
+	err = cudaMemcpy(d_start,start,number_of_buckets*sizeof(unsigned),cudaMemcpyHostToDevice);
+	if (err != cudaSuccess){
+		cout<<"Could not copy offset to cuda device\n";
+		exit(0);
+		}
+
+
+	cout<<"Initializing shuffle and copying to CUDA device\n";
+	for(int i = 0;i<N;i++){
+		shuffled[i].value = 0xffffff;	
+		shuffled[i].key = 0xffff;
+		}
+	
+	err = cudaMemcpy(d_shuffled,shuffled,N*sizeof(Entry),cudaMemcpyHostToDevice);
+	if (err != cudaSuccess){
+		cout<<"Could not copy shuffle to CUDA device\n";
+		exit(0);
+		}
+	
+	cudaEventRecord(begin);
+	
+	// Calling store()
+	cout<<"Calling store()\n";
+	store<<<num_blocks,threadsPerBlock>>>(d_shuffled,d_entry, d_start, d_offset,a,b,number_of_buckets, N);	
+	
+	cudaEventRecord(stop);
+		
+	cout<<"Copying shuffled[] back to host\n";
+	err = cudaMemcpy(shuffled,d_shuffled,N*sizeof(Entry),cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess){
+		cout<<"Could not copy shuffled[] from CUDA device\n"<<cudaGetErrorString(err);
+		exit(0);
+		}
+
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&time, begin, stop);
+	timer<<"Store: "<<time<<endl;
+	
+	cudaFree(d_entry);
+	cudaFree(d_offset);
+	cudaFree(d_global_flag);
+
+// We now have start[] and shuffled[]
+
+cout<<"\nBeginning Phase II\n";
+/***********************************Phase II********************/
+// INPUT: shuffled[] and start[]
+// OUPUT: seed[] and cuckoo[]
+
+// initialize cuckoo[] array
+	cout<<"Create and initialize cuckoo[]\n";
+	Entry *cuckoo;
+	
+	// Evaluating subtable size
+	int subtable_size = max_per_bucket*((float)1/4+(float)1/8);
+	cout<<"Using subtable size as "<<subtable_size<<endl;	
+	
+	int cuckoo_size = 3*number_of_buckets*subtable_size;
+	cout<<"Using cuckoo_size as "<<cuckoo_size<<endl;
+	cuckoo = new Entry[cuckoo_size];
+	for (int i = 0; i < cuckoo_size; i++)
+		cuckoo[i].key = 0xffffffff;
+
+	unsigned *seed;
+	seed = new unsigned [number_of_buckets];
+	
+	unsigned max_seeds = 10;	
+	cout<<"Taking maximum number of seeds to be "<<max_seeds<<endl;
+	cout<<"Generating random_numbers[]\n";
+	unsigned *random_numbers;
+	random_numbers = new unsigned [max_seeds];
+	for (int i = 0;i<max_seeds;i++)
+		random_numbers[i] = rand() +1;
+	
+	// Copy random_numbers
+	cout<<"Create, allocate memory and copy random_numbers[] to CUDA device\n";
+	unsigned *d_random_numbers;
+	err = cudaMalloc((void**)&d_random_numbers,max_seeds*sizeof(unsigned));
+	if (err != cudaSuccess){
+		cout<<"Could not allocate memory to random_numbers[] on device\n";
+		exit(0);
+		}
+	err = cudaMemcpy(d_random_numbers, random_numbers, max_seeds*sizeof(unsigned), cudaMemcpyHostToDevice);
+	if (err != cudaSuccess){
+		cout<<"Could not copy random_numbers[] to CUDA device\n";
+		exit(0);
+		}
+	
+	cout<<"Allocate memory to cuckoo[] and seed[] on device\n";	
+	Entry *d_cuckoo;
+	err = cudaMalloc((void**)&d_cuckoo, cuckoo_size*sizeof(Entry));
+	if (err != cudaSuccess){
+		cout<<"Could not allocate memory to cuckoo[] on device\n";
+		exit(0);
+		}
+	
+	unsigned *d_seed;
+	err = cudaMalloc((void**)&d_seed, number_of_buckets*sizeof(unsigned));
+	if (err != cudaSuccess){
+		cout<<"Could not allocate memory to seed[] on device\n";
+		exit(0);
+		}
+	
+	cout<<"Copying initialized cuckoo array to CUDA device\n";
+	err = cudaMemcpy(d_cuckoo,cuckoo,cuckoo_size*sizeof(Entry),cudaMemcpyHostToDevice);
+	if (err != cudaSuccess){
+		cout<<"Could not copy cuckoo[] to Device\n";
+		exit(0);
+		}
+	
+	cudaEventRecord(begin);
+	
+	// Evaluating phase 2
+	cout<<"Calling phase2()\n";	
+	phase2<<<num_blocks,threadsPerBlock>>>(d_random_numbers, d_shuffled, d_cuckoo,d_start, d_seed, subtable_size,N);
+	
+	cudaEventRecord(stop);
+	
+	cout<<"Copying back cuckoo[] and seed[]\n";
+	err = cudaMemcpy(cuckoo,d_cuckoo, cuckoo_size*sizeof(Entry), cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess){
+		cout<<"Could not copy cuckoo[] back to host\n"<<cudaGetErrorString(err);
+		exit(0);
+		}
+		
+	err = cudaMemcpy(seed,d_seed, number_of_buckets*sizeof(unsigned),cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess){
+		cout<<"Could not copy seed[] back to host\n";
+		exit(0);
+		}
+		
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&time, begin, stop);
+	timer<<"Phase 2: "<<time<<endl;
+	timer.close();
+	cout<<"\nHash table successfully created!!!\nFreeing CUDA memory\n";	
+	cudaFree(d_seed);
+	cudaFree(d_cuckoo);
+	cudaFree(d_random_numbers);
+	cudaFree(d_shuffled);	
+	cudaFree(d_start);
+	
+// We have a, b, seeds[] and cuckoo[] as our final output
+// Launching a query
+/*	unsigned kPrime = 1900813;
+	cout<<"Launching 10 querries to note the querry time\n";
+	cudaEventRecord(begin);
+	for (int i = 0; i<10;i++){
+			int test_index = rand()%N;
+			unsigned q_key =  entry[test_index].key;
+	//		int q_actual_value = entry[test_index].value;
+			int q_bucket =  ((a * q_key + b) % kPrime) % number_of_buckets;
+			int q_bucket_seed = seed[q_bucket];
+			unsigned constants_0 = q_bucket_seed ^ 0xffff;
+			unsigned constants_1 = q_bucket_seed ^ 0xcba9;
+			unsigned constants_2 = q_bucket_seed ^ 0x7531;
+			unsigned constants_3 = q_bucket_seed ^ 0xbeef;
+			unsigned constants_4 = q_bucket_seed ^ 0xd9f1;
+			unsigned constants_5 = q_bucket_seed ^ 0x337a;
+			unsigned index_x = ((constants_0 * q_key + constants_1)%kPrime) % subtable_size;
+			unsigned index_y = ((constants_2 * q_key + constants_3)%kPrime) % subtable_size;
+			unsigned index_z = ((constants_4 * q_key + constants_5)%kPrime) % subtable_size;
+			int k1 = cuckoo[3*subtable_size*q_bucket+index_x].key,
+				k2 = cuckoo[(3*subtable_size+1)*q_bucket+index_y].key,
+				k3 = cuckoo[(3*subtable_size+2)*q_bucket+index_z].key, k=0; 
+			if(k1 == q_key)
+					k = k1;
+			else if(k2 == q_key)		
+					k = k2;
+			else if(k3 == q_key)
+					k = k3;
+					
+			if (k)
+				cout<<"query for "<<q_key<<" successful!!"<<endl;
+			else
+				cout<<"query for "<<q_key<<" failed!!"<<" found "<<k1<<"\t"<<k2<<"\t"<<k3<<endl;
+	}
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&time, begin, stop);
+	timer<<"Query Rate: "<<time/10<<endl;
+	
+	s = "cuckoo.txt";
+	giveout(s,cuckoo,cuckoo_size);*/
+}
+
+/******************************************** MAIN ENDS HERE******************************************/
